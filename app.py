@@ -1,3 +1,34 @@
+# 在文件开头加载知识库
+KNOWLEDGE_FILE = 'knowledge.txt'
+knowledge_text = ""
+if os.path.exists(KNOWLEDGE_FILE):
+    with open(KNOWLEDGE_FILE, 'r', encoding='utf-8') as f:
+        knowledge_text = f.read()
+
+def retrieve_knowledge(query):
+    if not knowledge_text:
+        return ""
+    # 简单的关键词匹配
+    words = set(query.lower().split())
+    lines = knowledge_text.split('\n')
+    matched = []
+    for line in lines:
+        if any(w in line.lower() for w in words):
+            matched.append(line)
+    return "\n".join(matched[:3])
+
+# 在 /api/chat 的 AI 回复部分
+if not is_human_request(user_message):
+    # 检索知识
+    knowledge = retrieve_knowledge(user_message)
+    if knowledge:
+        # 将知识拼接到用户消息中（作为额外上下文）
+        context_message = f"【背景信息】\n{knowledge}\n\n【用户问题】\n{user_message}"
+        # 注意：这里需要临时构造消息，但不要污染历史
+        messages_for_api = history + [{"role": "user", "content": context_message}]
+    else:
+        messages_for_api = history + [{"role": "user", "content": user_message}]
+    # 调用 DeepSeek...
 import os
 import json
 import uuid
