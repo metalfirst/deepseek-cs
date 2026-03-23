@@ -3,21 +3,29 @@ import json
 import uuid
 import time
 import requests
+import hashlib
+import struct
+import base64
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
+from Crypto.Cipher import AES
 
 app = Flask(__name__)
 CORS(app)
 
-# ==================== 配置（建议使用环境变量） ====================
+# ==================== 配置（从环境变量读取） ====================
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "YOUR_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# 企业微信配置
+# 企业微信配置（发送消息用）
 WECOM_CORP_ID = "ww2e3b75e9697e5c62"
 WECOM_AGENT_ID = 1000005
 WECOM_SECRET = os.environ.get("WECOM_SECRET", "YOUR_SECRET")
 CUSTOMER_SERVICE_USERID = "YangJun"   # 请替换为实际客服成员账号
+
+# 企业微信回调配置（用于接收消息，可选）
+WECOM_TOKEN = os.environ.get("WECOM_TOKEN", "")
+WECOM_ENCODING_AES_KEY = os.environ.get("WECOM_ENCODING_AES_KEY", "")
 
 # 会话超时（秒）
 ACTIVITY_TIMEOUT = 5 * 60   # 5分钟
@@ -33,7 +41,7 @@ if os.path.exists(KNOWLEDGE_FILE):
     except Exception as e:
         print(f"读取知识库失败: {e}")
 
-# ==================== 新增：无关话题过滤关键词 ====================
+# ==================== 无关话题过滤 ====================
 OFF_TOPIC_KEYWORDS = [
     "天气", "weather", "股票", "stock", "政治", "politics", "新闻", "news",
     "游戏", "game", "娱乐", "entertainment", "电影", "movie", "音乐", "music",
@@ -42,14 +50,13 @@ OFF_TOPIC_KEYWORDS = [
 ]
 
 def is_out_of_scope(message):
-    """检测消息是否与业务完全无关（前置过滤）"""
     msg_lower = message.lower()
     for kw in OFF_TOPIC_KEYWORDS:
         if kw in msg_lower:
             return True
     return False
 
-# ==================== 系统提示词（已加强范围约束） ====================
+# ==================== 系统提示词 ====================
 SYSTEM_PROMPT = (
     "你是上海巨红贸易有限公司（Unionmetal Trading）的AI客服助手。\n"
     "公司主营钢材出口：钢卷（热轧、冷轧、不锈钢）、钢管（无缝、焊接、方矩管）、型钢（角钢、槽钢、工字钢、H型钢）。\n"
@@ -65,8 +72,8 @@ SYSTEM_PROMPT = (
 )
 
 # ==================== 内存存储 ====================
-memory_store = {}       # 会话历史: {session_id: history_json}
-activity_store = {}     # 最后活动时间: {session_id: timestamp}
+memory_store = {}
+activity_store = {}
 
 def get_session_history(session_id):
     if session_id not in memory_store:
@@ -92,12 +99,11 @@ def update_activity(session_id):
     activity_store[session_id] = time.time()
 
 def trim_history(history, max_turns=10):
-    """保留系统消息 + 最近 max_turns 轮对话"""
     if len(history) <= max_turns * 2 + 1:
         return history
     return [history[0]] + history[-(max_turns * 2):]
 
-# ==================== 企业微信 API ====================
+# ==================== 企业微信发送消息 API ====================
 wecom_token_cache = {"token": None, "expire_time": 0}
 
 def get_wecom_access_token():
@@ -144,16 +150,12 @@ def send_to_wecom(userid, content):
 
 # ==================== 多语言转人工检测 ====================
 def is_human_request(message):
-    """检测用户是否请求转人工（支持中文、英文、阿拉伯语）"""
-    # 中文
     cn_keywords = ["转人工", "人工客服", "人工服务", "找人工", "人工", "真人", "找客服"]
-    # 英文
     en_keywords = [
         "human", "agent", "speak to human", "talk to human",
         "customer service", "support", "real person", "live agent",
         "transfer to human", "human agent"
     ]
-    # 阿拉伯语
     ar_keywords = [
         "بشري", "دعم", "خدمة العملاء", "وكيل", "التحدث إلى بشري",
         "تحويل إلى وكيل", "مساعد بشري"
@@ -162,12 +164,10 @@ def is_human_request(message):
     msg_lower = message.lower()
     return any(k.lower() in msg_lower for k in all_keywords)
 
-# ==================== 知识库检索（简单关键词匹配） ====================
+# ==================== 知识库检索（简单关键词） ====================
 def retrieve_knowledge(query):
-    """从知识库中检索与查询相关的文本（基于关键词）"""
     if not knowledge_text:
         return ""
-    # 将查询分词，取所有非空词
     keywords = [w for w in query.lower().split() if len(w) > 1]
     if not keywords:
         return ""
@@ -177,8 +177,35 @@ def retrieve_knowledge(query):
         line_lower = line.lower()
         if any(k in line_lower for k in keywords):
             matched.append(line)
-    # 最多返回3条，避免上下文过长
     return "\n".join(matched[:3])
+
+# ==================== 企业微信回调验证 ====================
+def verify_wecom_signature(signature, timestamp, nonce, echostr):
+    """验证签名并解密echostr"""
+    if not WECOM_TOKEN or not WECOM_ENCODING_AES_KEY:
+        print("回调验证未配置：缺少 WECOM_TOKEN 或 WECOM_ENCODING_AES_KEY")
+        return None
+    # 1. 排序并计算签名
+    arr = [WECOM_TOKEN, timestamp, nonce, echostr]
+    arr.sort()
+    tmp_str = "".join(arr)
+    computed = hashlib.sha1(tmp_str.encode()).hexdigest()
+    if computed != signature:
+        return None
+    # 2. 解密 echostr
+    try:
+        aes_key = base64.b64decode(WECOM_ENCODING_AES_KEY + "=")
+        cipher = AES.new(aes_key, AES.MODE_CBC, aes_key[:16])
+        decrypted = cipher.decrypt(base64.b64decode(echostr))
+        # 去除补位字符
+        pad = decrypted[-1]
+        content = decrypted[16:-pad]
+        # 提取实际消息（前4字节为长度）
+        xml_len = struct.unpack("!I", content[:4])[0]
+        return content[4:4+xml_len].decode()
+    except Exception as e:
+        print("解密 echostr 失败:", e)
+        return None
 
 # ==================== Flask 路由 ====================
 @app.route('/')
@@ -199,9 +226,11 @@ def chat():
         session_id = str(uuid.uuid4())
     else:
         if check_activity(session_id):
+            # 生成新会话ID，避免重复提示
+            new_session_id = str(uuid.uuid4())
             reply = "由于长时间未活动，会话已结束。您可以重新开始对话。"
-            update_activity(session_id)
-            return jsonify({'reply': reply, 'session_id': session_id})
+            update_activity(new_session_id)
+            return jsonify({'reply': reply, 'session_id': new_session_id})
 
     update_activity(session_id)
 
@@ -220,7 +249,7 @@ def chat():
             success = False
         return jsonify({'reply': reply, 'session_id': session_id, 'human_transferred': success})
 
-    # 2. 无关话题过滤（避免调用 API）
+    # 2. 无关话题过滤
     if is_out_of_scope(user_message):
         reply = "抱歉，我们只提供钢材产品相关的咨询服务。请问您需要了解哪种钢材（如热轧卷、H型钢、无缝管等）？"
         return jsonify({'reply': reply, 'session_id': session_id})
@@ -230,11 +259,10 @@ def chat():
     history.append({"role": "user", "content": user_message})
     history = trim_history(history, max_turns=10)
 
-    # 检索知识库，如果找到相关内容，将其作为系统消息的补充
+    # 检索知识库
     knowledge = retrieve_knowledge(user_message)
     messages_for_api = history.copy()
     if knowledge:
-        # 将知识拼接到系统消息中
         sys_msg = messages_for_api[0]
         sys_msg["content"] = sys_msg["content"] + f"\n\n参考知识库信息：\n{knowledge}"
 
@@ -267,6 +295,29 @@ def chat():
         import traceback
         traceback.print_exc()
         return jsonify({'error': '服务器内部错误'}), 500
+
+@app.route('/wecom/callback', methods=['GET', 'POST'])
+def wecom_callback():
+    if request.method == 'GET':
+        # 验证URL
+        signature = request.args.get('msg_signature')
+        timestamp = request.args.get('timestamp')
+        nonce = request.args.get('nonce')
+        echostr = request.args.get('echostr')
+
+        if not all([signature, timestamp, nonce, echostr]):
+            return "Missing parameters", 400
+
+        plain_echostr = verify_wecom_signature(signature, timestamp, nonce, echostr)
+        if plain_echostr:
+            return plain_echostr
+        else:
+            return "Verification failed", 403
+
+    elif request.method == 'POST':
+        # 接收企业微信推送的消息（后续可扩展）
+        # 此处仅返回 success 以通过验证
+        return "success", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
