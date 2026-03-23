@@ -63,7 +63,7 @@ def is_out_of_scope(message):
 
 # ==================== 系统提示词 ====================
 SYSTEM_PROMPT = (
-    "你是上海巨红贸易有限公司（Unionmetal Trading）的AI客服助手。\n"
+    "你是巨红贸易(上海)有限公司（Unionmetal Trading）的AI客服助手。\n"
     "公司主营钢材出口：钢卷（热轧、冷轧、不锈钢）、钢管（无缝、焊接、方矩管）、型钢（角钢、槽钢、工字钢、H型钢）。\n"
     "你的职责仅限于回答关于钢材产品、规格、标准、采购、物流、付款等业务相关的问题。\n"
     "如果用户询问与公司业务完全无关的问题（如天气、股票、娱乐等），请礼貌地拒绝，并引导用户提出钢材相关的问题。\n"
@@ -79,6 +79,9 @@ SYSTEM_PROMPT = (
 # ==================== 会话管理（内存） ====================
 # 结构：{session_id: {"history": list, "last_active": float, "mode": str, "pending_reply": str}}
 memory_store = {}
+
+# 记录每个客服最近一次转人工的会话ID（用于简化回复）
+last_human_session = {}   # {客服userid: session_id}
 
 def get_session_data(session_id):
     if session_id not in memory_store:
@@ -259,8 +262,10 @@ def chat():
         try:
             # 设置为人工模式
             session_data["mode"] = "human"
-            # 通知客服，带上会话ID，方便客服回复时引用
-            notify_content = f"【网页转人工】\n会话ID: {session_id}\n消息: {user_message}\n请回复（格式：回复 <会话ID> 内容）"
+            # 记录该客服最近一次转人工的会话ID
+            last_human_session[CUSTOMER_SERVICE_USERID] = session_id
+            # 通知客服，简化提示（不强制要求带ID）
+            notify_content = f"【网页转人工】\n会话ID: {session_id}\n消息: {user_message}\n您可以直接回复内容，系统将自动发送给该用户。"
             success = send_to_wecom(CUSTOMER_SERVICE_USERID, notify_content)
             reply = "已为您转接人工客服，客服将尽快回复您。" if success else "转接人工失败，请稍后再试。"
         except Exception as e:
@@ -358,22 +363,28 @@ def wecom_callback():
 
             # 如果是客服的回复
             if from_user == CUSTOMER_SERVICE_USERID:
-                # 解析格式：回复 <session_id> 回复内容
+                # 尝试解析“回复 <session_id> 内容”格式
                 match = re.match(r'回复\s+([\w-]+)\s+(.*)', content)
                 if match:
                     session_id = match.group(1)
                     reply_text = match.group(2)
-                    if session_id in memory_store:
-                        memory_store[session_id]["pending_reply"] = reply_text
-                        # 可选：通知客服已收到
-                        send_to_wecom(from_user, f"已收到您的回复，已发送给用户 {session_id}")
-                    else:
-                        send_to_wecom(from_user, f"未找到会话 {session_id}，请检查会话ID是否正确。")
                 else:
-                    send_to_wecom(from_user, "回复格式不正确，请使用：回复 <会话ID> 内容")
+                    # 未指定会话ID，使用最近一次转人工的会话
+                    session_id = last_human_session.get(from_user)
+                    if not session_id:
+                        send_to_wecom(from_user, "没有找到待回复的会话，请使用格式：回复 <会话ID> 内容")
+                        return "success", 200
+                    reply_text = content   # 直接使用整条消息作为回复
+
+                # 保存回复
+                if session_id in memory_store:
+                    memory_store[session_id]["pending_reply"] = reply_text
+                    send_to_wecom(from_user, f"已发送回复给用户 {session_id}")
+                else:
+                    send_to_wecom(from_user, f"未找到会话 {session_id}")
                 return "success", 200
 
-            # 其他消息（如普通用户消息）暂不处理，但可以简单记录
+            # 其他消息（如普通用户消息）暂不处理
             logger.info("收到企业微信消息，发送者: %s, 内容: %s", from_user, content)
             return "success", 200
 
