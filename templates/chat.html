@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Shanghai Unionmetal Trading</title>
+    <title>AI客服助手</title>
     <style>
         * {
             box-sizing: border-box;
@@ -36,7 +36,6 @@
             text-align: center;
             font-size: 1.2rem;
             font-weight: bold;
-            letter-spacing: 1px;
         }
         .chat-messages {
             flex: 1;
@@ -96,7 +95,6 @@
             border-radius: 30px;
             outline: none;
             font-size: 1rem;
-            transition: border-color 0.2s;
         }
         .chat-input input:focus {
             border-color: #10a37f;
@@ -111,7 +109,6 @@
             cursor: pointer;
             font-size: 1rem;
             font-weight: 500;
-            transition: background 0.2s;
         }
         .chat-input button:hover {
             background: #0e8e6f;
@@ -146,13 +143,13 @@
         </div>
     </div>
     <div class="chat-input">
-        <input type="text" id="userInput" placeholder="Pls imput ur question..." autocomplete="off">
-        <button onclick="sendMessage()">send</button>
+        <input type="text" id="userInput" placeholder="输入你的问题..." autocomplete="off">
+        <button onclick="sendMessage()">发送</button>
     </div>
 </div>
 
 <script>
-    // -------------------- 会话管理 --------------------
+    // 会话ID管理
     let sessionId = localStorage.getItem('chat_session_id');
     if (!sessionId) {
         sessionId = generateUUID();
@@ -166,8 +163,8 @@
         });
     }
 
-    // -------------------- 空闲计时器（5分钟无活动自动结束会话）--------------------
-    const IDLE_TIMEOUT = 5 * 60 * 1000; // 5分钟
+    // 空闲计时器（5分钟）
+    const IDLE_TIMEOUT = 5 * 60 * 1000;
     let idleTimer = null;
 
     function resetIdleTimer() {
@@ -176,16 +173,14 @@
     }
 
     function onIdleTimeout() {
-        addMessage("Since you have not had any new questions for a long time, this conversation has ended. You can start the question again.", 'system');
-        // 清除本地 session_id，下次发消息会重新生成
+        addMessage("由于您长时间没有新的问题，本次对话已结束。您可以重新开始提问。", 'system');
         localStorage.removeItem('chat_session_id');
         sessionId = generateUUID();
         localStorage.setItem('chat_session_id', sessionId);
-        // 重置计时器（避免重复触发）
         resetIdleTimer();
     }
 
-    // -------------------- 轮询获取客服回复 --------------------
+    // 轮询客服回复
     let pollInterval = null;
 
     function startPolling() {
@@ -204,22 +199,13 @@
         }, 3000);
     }
 
-    function stopPolling() {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-            pollInterval = null;
-        }
-    }
-
-    // -------------------- 发送消息 --------------------
+    // 发送消息
     async function sendMessage() {
         const input = document.getElementById('userInput');
         const message = input.value.trim();
         if (!message) return;
 
-        // 重置空闲计时器
         resetIdleTimer();
-
         addMessage(message, 'user');
         input.value = '';
 
@@ -236,23 +222,21 @@
 
             if (data.reply) {
                 addMessage(data.reply, 'ai');
-                // 如果后端返回了新的 session_id，更新本地存储
                 if (data.session_id && data.session_id !== sessionId) {
                     sessionId = data.session_id;
                     localStorage.setItem('chat_session_id', sessionId);
                 }
             } else if (data.error) {
-                addMessage('Sorry：' + data.error, 'ai');
+                addMessage('抱歉：' + data.error, 'ai');
             } else {
-                addMessage('Sorry, something went wrong with the service. Please try again later.', 'ai');
+                addMessage('抱歉，服务出错了，请稍后再试。', 'ai');
             }
         } catch (error) {
             removeLoading(loadingDiv);
-            addMessage('Network error, please check the connection.', 'ai');
+            addMessage('网络错误，请检查连接。', 'ai');
         }
     }
 
-    // -------------------- 辅助函数 --------------------
     function addMessage(text, sender) {
         const messagesDiv = document.getElementById('messages');
         const messageDiv = document.createElement('div');
@@ -269,7 +253,7 @@
         const messagesDiv = document.getElementById('messages');
         const loadingDiv = document.createElement('div');
         loadingDiv.className = 'message ai-message';
-        loadingDiv.innerHTML = '<div class="bubble">🤔Thinking...</div>';
+        loadingDiv.innerHTML = '<div class="bubble">🤔 思考中...</div>';
         messagesDiv.appendChild(loadingDiv);
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
         return loadingDiv;
@@ -279,18 +263,15 @@
         if (loadingDiv) loadingDiv.remove();
     }
 
-    // 回车发送
     document.getElementById('userInput').addEventListener('keypress', function(e) {
         if (e.key === 'Enter') sendMessage();
     });
 
-    // 页面加载时启动空闲计时器和轮询
     window.addEventListener('load', function() {
         resetIdleTimer();
         startPolling();
     });
 
-    // 页面关闭前清理轮询
     window.addEventListener('beforeunload', function() {
         if (pollInterval) clearInterval(pollInterval);
     });
