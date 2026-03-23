@@ -3,11 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>AI客服助手</title>
+    <title>Shanghai Unionmetal Trading Co., Ltd.</title>
     <style>
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             margin: 0;
@@ -48,15 +46,9 @@
             display: flex;
             animation: fadeIn 0.3s ease;
         }
-        .user-message {
-            justify-content: flex-end;
-        }
-        .ai-message {
-            justify-content: flex-start;
-        }
-        .system-message {
-            justify-content: center;
-        }
+        .user-message { justify-content: flex-end; }
+        .ai-message { justify-content: flex-start; }
+        .system-message { justify-content: center; }
         .bubble {
             max-width: 80%;
             padding: 10px 16px;
@@ -113,24 +105,13 @@
         .chat-input button:hover {
             background: #0e8e6f;
         }
-        .loading {
-            text-align: center;
-            color: #6c757d;
-            padding: 10px;
-            font-style: italic;
-        }
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(10px); }
             to { opacity: 1; transform: translateY(0); }
         }
         @media (max-width: 600px) {
-            .chat-container {
-                height: 100vh;
-                border-radius: 0;
-            }
-            .bubble {
-                max-width: 90%;
-            }
+            .chat-container { height: 100vh; border-radius: 0; }
+            .bubble { max-width: 90%; }
         }
     </style>
 </head>
@@ -143,17 +124,38 @@
         </div>
     </div>
     <div class="chat-input">
-        <input type="text" id="userInput" placeholder="输入你的问题..." autocomplete="off">
+        <input type="text" id="userInput" placeholder="Pls imput ur question..." autocomplete="off">
         <button onclick="sendMessage()">发送</button>
     </div>
 </div>
 
 <script>
-    // 会话ID管理
-    let sessionId = localStorage.getItem('chat_session_id');
-    if (!sessionId) {
+    // 会话ID管理（兼容iframe环境，localStorage不可用时使用内存）
+    let sessionId = null;
+    let memorySessionId = null;
+
+    function getStoredSessionId() {
+        try {
+            if (localStorage.getItem('chat_session_id')) {
+                return localStorage.getItem('chat_session_id');
+            }
+        } catch(e) { /* localStorage可能被禁用 */ }
+        return memorySessionId;
+    }
+
+    function setStoredSessionId(id) {
+        try {
+            localStorage.setItem('chat_session_id', id);
+        } catch(e) { /* 忽略 */ }
+        memorySessionId = id;
+    }
+
+    let storedId = getStoredSessionId();
+    if (!storedId) {
         sessionId = generateUUID();
-        localStorage.setItem('chat_session_id', sessionId);
+        setStoredSessionId(sessionId);
+    } else {
+        sessionId = storedId;
     }
 
     function generateUUID() {
@@ -173,15 +175,17 @@
     }
 
     function onIdleTimeout() {
-        addMessage("由于您长时间没有新的问题，本次对话已结束。您可以重新开始提问。", 'system');
-        localStorage.removeItem('chat_session_id');
+        addMessage("As you have not raised any new questions for a long time, this conversation has ended. You can start asking questions again.", 'system');
+        setStoredSessionId(null);
         sessionId = generateUUID();
-        localStorage.setItem('chat_session_id', sessionId);
+        setStoredSessionId(sessionId);
         resetIdleTimer();
     }
 
-    // 轮询客服回复
+    // 轮询客服回复（带重试机制）
     let pollInterval = null;
+    let pollRetries = 0;
+    const MAX_RETRIES = 5;
 
     function startPolling() {
         if (pollInterval) clearInterval(pollInterval);
@@ -192,14 +196,20 @@
                 const data = await resp.json();
                 if (data.reply) {
                     addMessage(data.reply, 'ai');
+                    pollRetries = 0;
                 }
             } catch (err) {
                 console.error('轮询失败:', err);
+                pollRetries++;
+                if (pollRetries > MAX_RETRIES) {
+                    console.warn('轮询多次失败，尝试重新启动');
+                    clearInterval(pollInterval);
+                    setTimeout(startPolling, 5000);
+                }
             }
         }, 3000);
     }
 
-    // 发送消息
     async function sendMessage() {
         const input = document.getElementById('userInput');
         const message = input.value.trim();
@@ -224,16 +234,16 @@
                 addMessage(data.reply, 'ai');
                 if (data.session_id && data.session_id !== sessionId) {
                     sessionId = data.session_id;
-                    localStorage.setItem('chat_session_id', sessionId);
+                    setStoredSessionId(sessionId);
                 }
             } else if (data.error) {
-                addMessage('抱歉：' + data.error, 'ai');
+                addMessage('Sorry：' + data.error, 'ai');
             } else {
-                addMessage('抱歉，服务出错了，请稍后再试。', 'ai');
+                addMessage('Sorry, there was a service error. Please try again later.', 'ai');
             }
         } catch (error) {
             removeLoading(loadingDiv);
-            addMessage('网络错误，请检查连接。', 'ai');
+            addMessage('Network error, please check the connection.', 'ai');
         }
     }
 
@@ -253,7 +263,7 @@
         const messagesDiv = document.getElementById('messages');
         const loadingDiv = document.createElement('div');
         loadingDiv.className = 'message ai-message';
-        loadingDiv.innerHTML = '<div class="bubble">🤔 思考中...</div>';
+        loadingDiv.innerHTML = '<div class="bubble">🤔 Thinking...</div>';
         messagesDiv.appendChild(loadingDiv);
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
         return loadingDiv;
@@ -263,13 +273,29 @@
         if (loadingDiv) loadingDiv.remove();
     }
 
-    document.getElementById('userInput').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') sendMessage();
+    function ensurePolling() {
+        if (!pollInterval) startPolling();
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        resetIdleTimer();
+        ensurePolling();
+        // 当iframe可见性变化时恢复轮询
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting && !pollInterval) ensurePolling();
+            });
+        }, { threshold: 0 });
+        observer.observe(document.body);
     });
 
-    window.addEventListener('load', function() {
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
         resetIdleTimer();
-        startPolling();
+        ensurePolling();
+    }
+
+    document.getElementById('userInput').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') sendMessage();
     });
 
     window.addEventListener('beforeunload', function() {
