@@ -33,11 +33,30 @@ if os.path.exists(KNOWLEDGE_FILE):
     except Exception as e:
         print(f"读取知识库失败: {e}")
 
-# 系统提示词
+# ==================== 新增：无关话题过滤关键词 ====================
+OFF_TOPIC_KEYWORDS = [
+    "天气", "weather", "股票", "stock", "政治", "politics", "新闻", "news",
+    "游戏", "game", "娱乐", "entertainment", "电影", "movie", "音乐", "music",
+    "赌博", "gambling", "色情", "porn", "暴力", "violence", "战争", "war",
+    "比特币", "bitcoin", "加密货币", "crypto", "明星", "celebrity"
+]
+
+def is_out_of_scope(message):
+    """检测消息是否与业务完全无关（前置过滤）"""
+    msg_lower = message.lower()
+    for kw in OFF_TOPIC_KEYWORDS:
+        if kw in msg_lower:
+            return True
+    return False
+
+# ==================== 系统提示词（已加强范围约束） ====================
 SYSTEM_PROMPT = (
     "你是上海巨红贸易有限公司（Unionmetal Trading）的AI客服助手。\n"
     "公司主营钢材出口：钢卷（热轧、冷轧、不锈钢）、钢管（无缝、焊接、方矩管）、型钢（角钢、槽钢、工字钢、H型钢）。\n"
-    "你的任务是：\n"
+    "你的职责仅限于回答关于钢材产品、规格、标准、采购、物流、付款等业务相关的问题。\n"
+    "如果用户询问与公司业务完全无关的问题（如天气、股票、娱乐等），请礼貌地拒绝，并引导用户提出钢材相关的问题。\n"
+    "示例回复：'抱歉，我们只提供钢材相关咨询服务。请问您需要了解哪种钢材产品？'\n"
+    "其他任务：\n"
     "1. 用客户使用的语言（中文、英语、阿拉伯语等）回复。\n"
     "2. 回答关于产品规格、标准、最小起订量、交货期、付款方式等专业问题。\n"
     "3. 如果客户询问价格，引导其提供具体需求（产品、规格、数量、目的港）并告知将转销售跟进。\n"
@@ -186,7 +205,7 @@ def chat():
 
     update_activity(session_id)
 
-    # 转人工检测
+    # 1. 转人工检测
     if is_human_request(user_message):
         try:
             notify_content = f"【Human Request】\nSession: {session_id}\nMessage: {user_message}\nPlease handle."
@@ -201,7 +220,12 @@ def chat():
             success = False
         return jsonify({'reply': reply, 'session_id': session_id, 'human_transferred': success})
 
-    # 正常 AI 回复
+    # 2. 无关话题过滤（避免调用 API）
+    if is_out_of_scope(user_message):
+        reply = "抱歉，我们只提供钢材产品相关的咨询服务。请问您需要了解哪种钢材（如热轧卷、H型钢、无缝管等）？"
+        return jsonify({'reply': reply, 'session_id': session_id})
+
+    # 3. 正常 AI 回复
     history = get_session_history(session_id)
     history.append({"role": "user", "content": user_message})
     history = trim_history(history, max_turns=10)
@@ -210,11 +234,9 @@ def chat():
     knowledge = retrieve_knowledge(user_message)
     messages_for_api = history.copy()
     if knowledge:
-        # 在系统消息之后插入一条临时知识消息（作为系统角色）
-        # 但注意 history 中第一条是系统消息，我们将知识拼接到原系统消息中更简单
+        # 将知识拼接到系统消息中
         sys_msg = messages_for_api[0]
         sys_msg["content"] = sys_msg["content"] + f"\n\n参考知识库信息：\n{knowledge}"
-        # 或者添加一条临时用户消息携带知识，两者都可，这里选择直接扩写系统消息
 
     headers = {
         'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
