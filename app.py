@@ -6,6 +6,7 @@ import hashlib
 import base64
 import struct
 import logging
+import re
 import xml.etree.ElementTree as ET
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
@@ -28,7 +29,7 @@ WECOM_AGENT_ID = 1000005
 WECOM_SECRET = os.environ.get("WECOM_SECRET")
 CUSTOMER_SERVICE_USERID = os.environ.get("CUSTOMER_SERVICE_USERID", "YangJun")
 
-# 回调配置（可选）
+# 回调配置（用于接收客服回复）
 WECOM_TOKEN = os.environ.get("WECOM_TOKEN")
 WECOM_ENCODING_AES_KEY = os.environ.get("WECOM_ENCODING_AES_KEY")
 
@@ -76,17 +77,27 @@ SYSTEM_PROMPT = (
 )
 
 # ==================== 会话管理（内存） ====================
+# 结构：{session_id: {"history": list, "last_active": float, "mode": str, "pending_reply": str}}
 memory_store = {}
 
-def get_session_history(session_id):
+def get_session_data(session_id):
     if session_id not in memory_store:
         history = [{"role": "system", "content": SYSTEM_PROMPT}]
-        memory_store[session_id] = {"history": history, "last_active": time.time()}
-        return history
-    return memory_store[session_id]["history"]
+        memory_store[session_id] = {
+            "history": history,
+            "last_active": time.time(),
+            "mode": "auto",          # auto 或 human
+            "pending_reply": ""      # 待发送给用户的客服回复
+        }
+        return memory_store[session_id]
+    return memory_store[session_id]
+
+def get_session_history(session_id):
+    return get_session_data(session_id)["history"]
 
 def save_session_history(session_id, history):
-    memory_store[session_id] = {"history": history, "last_active": time.time()}
+    memory_store[session_id]["history"] = history
+    memory_store[session_id]["last_active"] = time.time()
 
 def check_activity(session_id):
     if session_id in memory_store:
@@ -227,36 +238,50 @@ def chat():
     if not user_message:
         return jsonify({'error': '消息不能为空'}), 400
 
+    # 会话管理
     if not session_id:
         session_id = str(uuid.uuid4())
     else:
         if check_activity(session_id):
             new_session_id = str(uuid.uuid4())
             reply = "由于长时间未活动，会话已结束。您可以重新开始对话。"
+            # 新会话默认 auto 模式
+            get_session_data(new_session_id)  # 初始化
             update_activity(new_session_id)
             return jsonify({'reply': reply, 'session_id': new_session_id})
 
+    # 获取/初始化会话数据
+    session_data = get_session_data(session_id)
     update_activity(session_id)
 
-    # 转人工
+    # 转人工检测
     if is_human_request(user_message):
         try:
-            notify = f"【网页转人工】\nSession: {session_id}\n消息: {user_message}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            success = send_to_wecom(CUSTOMER_SERVICE_USERID, notify)
-            reply = "已为您转接人工客服，请稍等。" if success else "转接人工失败，请稍后再试。"
+            # 设置为人工模式
+            session_data["mode"] = "human"
+            # 通知客服，带上会话ID，方便客服回复时引用
+            notify_content = f"【网页转人工】\n会话ID: {session_id}\n消息: {user_message}\n请回复（格式：回复 <会话ID> 内容）"
+            success = send_to_wecom(CUSTOMER_SERVICE_USERID, notify_content)
+            reply = "已为您转接人工客服，客服将尽快回复您。" if success else "转接人工失败，请稍后再试。"
         except Exception as e:
             logger.error("转人工异常: %s", e)
             reply = "转接人工时发生内部错误。"
             success = False
         return jsonify({'reply': reply, 'session_id': session_id, 'human_transferred': success})
 
-    # 无关话题
+    # 人工模式：将用户消息转发给客服
+    if session_data["mode"] == "human":
+        forward_content = f"【用户消息】\n会话: {session_id}\n{user_message}"
+        send_to_wecom(CUSTOMER_SERVICE_USERID, forward_content)
+        return jsonify({'reply': '您的消息已转交人工客服，请耐心等待回复。', 'session_id': session_id})
+
+    # 无关话题过滤（仅自动模式）
     if is_out_of_scope(user_message):
         reply = "抱歉，我们只提供钢材产品相关的咨询服务。请问您需要了解哪种钢材？"
         return jsonify({'reply': reply, 'session_id': session_id})
 
-    # AI 回复
-    history = get_session_history(session_id)
+    # 自动模式：AI 回复
+    history = session_data["history"]
     history.append({"role": "user", "content": user_message})
     history = trim_history(history)
 
@@ -273,13 +298,29 @@ def chat():
         ai_reply = resp.json()['choices'][0]['message']['content']
         history.append({"role": "assistant", "content": ai_reply})
         history = trim_history(history)
-        save_session_history(session_id, history)
+        session_data["history"] = history
         return jsonify({'reply': ai_reply, 'session_id': session_id})
     except Exception as e:
         logger.error("DeepSeek API 调用失败: %s", e)
         return jsonify({'error': '服务暂时不可用，请稍后再试'}), 500
 
-# ==================== 企业微信回调 ====================
+# ==================== 轮询接口（获取客服回复） ====================
+@app.route('/api/poll', methods=['GET'])
+def poll():
+    session_id = request.args.get('session_id')
+    if not session_id:
+        return jsonify({'error': '缺少 session_id'}), 400
+    session_data = memory_store.get(session_id)
+    if not session_data:
+        return jsonify({'reply': None})
+    pending = session_data.get("pending_reply", "")
+    if pending:
+        session_data["pending_reply"] = ""  # 清空
+        return jsonify({'reply': pending})
+    else:
+        return jsonify({'reply': None})
+
+# ==================== 企业微信回调（接收客服回复） ====================
 @app.route('/wecom/callback', methods=['GET', 'POST'])
 def wecom_callback():
     if request.method == 'GET':
@@ -311,50 +352,31 @@ def wecom_callback():
             msg_data = parse_wecom_xml(plain_xml)
             if not msg_data or msg_data.get('MsgType') != 'text':
                 return "success", 200
-            user_id = msg_data.get('FromUserName')
-            user_input = msg_data.get('Content', '').strip()
-            if not user_input:
+
+            from_user = msg_data.get('FromUserName')
+            content = msg_data.get('Content', '').strip()
+
+            # 如果是客服的回复
+            if from_user == CUSTOMER_SERVICE_USERID:
+                # 解析格式：回复 <session_id> 回复内容
+                match = re.match(r'回复\s+([\w-]+)\s+(.*)', content)
+                if match:
+                    session_id = match.group(1)
+                    reply_text = match.group(2)
+                    if session_id in memory_store:
+                        memory_store[session_id]["pending_reply"] = reply_text
+                        # 可选：通知客服已收到
+                        send_to_wecom(from_user, f"已收到您的回复，已发送给用户 {session_id}")
+                    else:
+                        send_to_wecom(from_user, f"未找到会话 {session_id}，请检查会话ID是否正确。")
+                else:
+                    send_to_wecom(from_user, "回复格式不正确，请使用：回复 <会话ID> 内容")
                 return "success", 200
 
-            session_id = f"wecom_{user_id}"
-            if check_activity(session_id):
-                pass
-            update_activity(session_id)
-
-            if is_human_request(user_input):
-                notify = f"【企微转人工】\n用户: {user_id}\n消息: {user_input}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                success = send_to_wecom(CUSTOMER_SERVICE_USERID, notify)
-                reply = "收到，正在为您转接人工客服，请稍候..." if success else "转接请求已发送，请稍后。"
-                send_to_wecom(user_id, reply)
-                return "success", 200
-
-            if is_out_of_scope(user_input):
-                reply = "抱歉，我们只提供钢材产品相关的咨询服务。"
-                send_to_wecom(user_id, reply)
-                return "success", 200
-
-            history = get_session_history(session_id)
-            history.append({"role": "user", "content": user_input})
-            history = trim_history(history)
-            knowledge = retrieve_knowledge(user_input)
-            messages = history.copy()
-            if knowledge:
-                messages[0]["content"] += f"\n\n参考知识库信息：\n{knowledge}"
-
-            headers = {'Authorization': f'Bearer {DEEPSEEK_API_KEY}', 'Content-Type': 'application/json'}
-            payload = {"model": "deepseek-chat", "messages": messages, "temperature": 0.7, "stream": False}
-            try:
-                resp = requests.post(DEEPSEEK_API_URL, json=payload, headers=headers, timeout=30)
-                resp.raise_for_status()
-                ai_reply = resp.json()['choices'][0]['message']['content']
-                history.append({"role": "assistant", "content": ai_reply})
-                history = trim_history(history)
-                save_session_history(session_id, history)
-                send_to_wecom(user_id, ai_reply)
-            except Exception as e:
-                logger.error("DeepSeek API 错误: %s", e)
-                send_to_wecom(user_id, "抱歉，AI 服务暂时繁忙，请稍后再试。")
+            # 其他消息（如普通用户消息）暂不处理，但可以简单记录
+            logger.info("收到企业微信消息，发送者: %s, 内容: %s", from_user, content)
             return "success", 200
+
         except Exception as e:
             logger.error("处理企微回调失败: %s", e, exc_info=True)
             return "success", 200
@@ -362,7 +384,6 @@ def wecom_callback():
 # ==================== 企业微信域名验证路由 ====================
 @app.route('/WW_verify_5nyB6B5oVM0zoiCr.txt')
 def wecom_verify():
-    # 请将下方字符串替换为你下载的验证文件中的实际内容
     return "5nyB6B5oVM0zoiCr"
 
 # ==================== 健康检查 ====================
