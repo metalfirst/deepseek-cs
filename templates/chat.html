@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>AI客服助手</title>
+    <title>Shanghai Unionmetal Trading</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -40,6 +40,9 @@
         .ai-message {
             justify-content: flex-start;
         }
+        .system-message {
+            justify-content: center;
+        }
         .bubble {
             max-width: 70%;
             padding: 10px 15px;
@@ -55,6 +58,13 @@
             background: #e5e5ea;
             color: black;
             border-bottom-left-radius: 4px;
+        }
+        .system-message .bubble {
+            background: #e9ecef;
+            color: #6c757d;
+            font-style: italic;
+            text-align: center;
+            font-size: 0.9rem;
         }
         .chat-input {
             display: flex;
@@ -96,7 +106,7 @@
             </div>
         </div>
         <div class="chat-input">
-            <input type="text" id="userInput" placeholder="输入你的问题..." autocomplete="off">
+            <input type="text" id="userInput" placeholder="Pls ask ur question..." autocomplete="off">
             <button onclick="sendMessage()">发送</button>
         </div>
     </div>
@@ -107,6 +117,28 @@
         if (!sessionId) {
             sessionId = generateUUID();
             localStorage.setItem('chat_session_id', sessionId);
+        }
+
+        // 空闲超时设置（5分钟）
+        const IDLE_TIMEOUT = 5 * 60 * 1000; // 5分钟
+        let idleTimer = null;
+
+        // 重置空闲计时器
+        function resetIdleTimer() {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(onIdleTimeout, IDLE_TIMEOUT);
+        }
+
+        // 空闲超时处理
+        function onIdleTimeout() {
+            // 在聊天窗口添加系统提示
+            addMessage("Since you haven't raised any new questions for a long time, this conversation has ended. You can start asking questions again.", 'system');
+            // 清除本地 session_id，下次发消息会重新生成
+            localStorage.removeItem('chat_session_id');
+            sessionId = generateUUID();
+            localStorage.setItem('chat_session_id', sessionId);
+            // 重置计时器（避免重复触发）
+            resetIdleTimer();
         }
 
         function generateUUID() {
@@ -120,6 +152,9 @@
             const input = document.getElementById('userInput');
             const message = input.value.trim();
             if (!message) return;
+
+            // 重置空闲计时器
+            resetIdleTimer();
 
             addMessage(message, 'user');
             input.value = '';
@@ -136,15 +171,18 @@
                 removeLoading(loadingDiv);
                 if (data.reply) {
                     addMessage(data.reply, 'ai');
-                    if (data.session_id) sessionId = data.session_id;
+                    if (data.session_id) {
+                        sessionId = data.session_id;
+                        localStorage.setItem('chat_session_id', sessionId);
+                    }
                 } else if (data.error) {
-                    addMessage('抱歉：' + data.error, 'ai');
+                    addMessage('Sorry：' + data.error, 'ai');
                 } else {
-                    addMessage('抱歉，服务出错了，请稍后再试。', 'ai');
+                    addMessage('Sorry, there was a service error. Please try again later.', 'ai');
                 }
             } catch (error) {
                 removeLoading(loadingDiv);
-                addMessage('网络错误，请检查连接。', 'ai');
+                addMessage('Network error, please check the connection.', 'ai');
             }
         }
 
@@ -161,7 +199,7 @@
             const messagesDiv = document.getElementById('messages');
             const loadingDiv = document.createElement('div');
             loadingDiv.className = 'message ai-message';
-            loadingDiv.innerHTML = '<div class="bubble">🤔 思考中...</div>';
+            loadingDiv.innerHTML = '<div class="bubble">🤔 Thinking...</div>';
             messagesDiv.appendChild(loadingDiv);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
             return loadingDiv;
@@ -176,6 +214,11 @@
             div.textContent = text;
             return div.innerHTML;
         }
+
+        // 页面加载时启动空闲计时器
+        document.addEventListener('DOMContentLoaded', function() {
+            resetIdleTimer();
+        });
 
         document.getElementById('userInput').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') sendMessage();
