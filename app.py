@@ -2,44 +2,51 @@ import os
 import json
 import uuid
 import time
-import requests
 import hashlib
-import struct
 import base64
+import struct
+import logging
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from Crypto.Cipher import AES
+import requests
 
 app = Flask(__name__)
 CORS(app)
 
+# ==================== 日志配置 ====================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # ==================== 配置（从环境变量读取） ====================
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "YOUR_API_KEY")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# 企业微信配置（发送消息用）
+# 企业微信主动发送消息配置
 WECOM_CORP_ID = "ww2e3b75e9697e5c62"
 WECOM_AGENT_ID = 1000005
-WECOM_SECRET = os.environ.get("WECOM_SECRET", "YOUR_SECRET")
-CUSTOMER_SERVICE_USERID = "YangJun"   # 请替换为实际客服成员账号
+WECOM_SECRET = os.environ.get("WECOM_SECRET")
+CUSTOMER_SERVICE_USERID = os.environ.get("CUSTOMER_SERVICE_USERID", "YangJun")
 
-# 企业微信回调配置（用于接收消息，可选）
-WECOM_TOKEN = os.environ.get("WECOM_TOKEN", "")
-WECOM_ENCODING_AES_KEY = os.environ.get("WECOM_ENCODING_AES_KEY", "")
+# 企业微信回调配置（接收消息用）
+WECOM_TOKEN = os.environ.get("WECOM_TOKEN")
+WECOM_ENCODING_AES_KEY = os.environ.get("WECOM_ENCODING_AES_KEY")
 
 # 会话超时（秒）
-ACTIVITY_TIMEOUT = 5 * 60   # 5分钟
+ACTIVITY_TIMEOUT = 5 * 60
 
 # 知识库文件（与 app.py 同目录）
 KNOWLEDGE_FILE = "knowledge.txt"
 knowledge_text = ""
-
 if os.path.exists(KNOWLEDGE_FILE):
     try:
         with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
             knowledge_text = f.read()
+            logger.info("知识库加载成功，长度: %d", len(knowledge_text))
     except Exception as e:
-        print(f"读取知识库失败: {e}")
+        logger.error("读取知识库失败: %s", e)
 
 # ==================== 无关话题过滤 ====================
 OFF_TOPIC_KEYWORDS = [
@@ -58,7 +65,7 @@ def is_out_of_scope(message):
 
 # ==================== 系统提示词 ====================
 SYSTEM_PROMPT = (
-    "你是上海巨红贸易有限公司（Unionmetal Trading）的AI客服助手。\n"
+    "你是巨红贸易(上海)有限公司（Unionmetal Trading）的AI客服助手。\n"
     "公司主营钢材出口：钢卷（热轧、冷轧、不锈钢）、钢管（无缝、焊接、方矩管）、型钢（角钢、槽钢、工字钢、H型钢）。\n"
     "你的职责仅限于回答关于钢材产品、规格、标准、采购、物流、付款等业务相关的问题。\n"
     "如果用户询问与公司业务完全无关的问题（如天气、股票、娱乐等），请礼貌地拒绝，并引导用户提出钢材相关的问题。\n"
@@ -72,36 +79,71 @@ SYSTEM_PROMPT = (
 )
 
 # ==================== 内存存储 ====================
-memory_store = {}
-activity_store = {}
+memory_store = {}          # {session_id: {"history": list, "last_active": timestamp}}
+activity_store = {}        # 与 memory_store 中的 last_active 同步，但为了兼容原有逻辑保留
 
 def get_session_history(session_id):
+    """获取会话历史，若不存在则初始化"""
     if session_id not in memory_store:
         history = [{"role": "system", "content": SYSTEM_PROMPT}]
-        memory_store[session_id] = json.dumps(history)
+        memory_store[session_id] = {"history": history, "last_active": time.time()}
         return history
-    return json.loads(memory_store[session_id])
+    return memory_store[session_id]["history"]
 
 def save_session_history(session_id, history):
-    memory_store[session_id] = json.dumps(history)
+    """保存会话历史并更新最后活动时间"""
+    memory_store[session_id] = {"history": history, "last_active": time.time()}
 
 def check_activity(session_id):
-    last = activity_store.get(session_id, 0)
-    if last == 0 or time.time() - last > ACTIVITY_TIMEOUT:
-        if session_id in memory_store:
+    """检查会话是否超时，超时则删除并返回 True"""
+    if session_id in memory_store:
+        last = memory_store[session_id]["last_active"]
+        if time.time() - last > ACTIVITY_TIMEOUT:
             del memory_store[session_id]
-        if session_id in activity_store:
-            del activity_store[session_id]
-        return True
+            return True
     return False
 
 def update_activity(session_id):
-    activity_store[session_id] = time.time()
+    """更新会话的最后活动时间"""
+    if session_id in memory_store:
+        memory_store[session_id]["last_active"] = time.time()
 
 def trim_history(history, max_turns=10):
+    """保留系统消息 + 最近 max_turns 轮对话"""
     if len(history) <= max_turns * 2 + 1:
         return history
     return [history[0]] + history[-(max_turns * 2):]
+
+# ==================== 知识库检索（关键词匹配） ====================
+def retrieve_knowledge(query):
+    if not knowledge_text:
+        return ""
+    keywords = [w for w in query.lower().split() if len(w) > 1]
+    if not keywords:
+        return ""
+    lines = knowledge_text.split('\n')
+    matched = []
+    for line in lines:
+        line_lower = line.lower()
+        if any(k in line_lower for k in keywords):
+            matched.append(line)
+    return "\n".join(matched[:3])
+
+# ==================== 多语言转人工检测 ====================
+def is_human_request(message):
+    cn_keywords = ["转人工", "人工客服", "人工服务", "找人工", "人工", "真人", "找客服"]
+    en_keywords = [
+        "human", "agent", "speak to human", "talk to human",
+        "customer service", "support", "real person", "live agent",
+        "transfer to human", "human agent"
+    ]
+    ar_keywords = [
+        "بشري", "دعم", "خدمة العملاء", "وكيل", "التحدث إلى بشري",
+        "تحويل إلى وكيل", "مساعد بشري"
+    ]
+    all_keywords = cn_keywords + en_keywords + ar_keywords
+    msg_lower = message.lower()
+    return any(k.lower() in msg_lower for k in all_keywords)
 
 # ==================== 企业微信发送消息 API ====================
 wecom_token_cache = {"token": None, "expire_time": 0}
@@ -120,12 +162,13 @@ def get_wecom_access_token():
             wecom_token_cache["expire_time"] = now + expires_in - 300
             return token
         else:
-            print("获取 token 失败:", resp)
+            logger.error("获取 access_token 失败: %s", resp)
     except Exception as e:
-        print("请求 token 异常:", e)
+        logger.error("请求 access_token 异常: %s", e)
     return None
 
 def send_to_wecom(userid, content):
+    """发送消息给企业微信成员"""
     token = get_wecom_access_token()
     if not token:
         return False
@@ -142,69 +185,60 @@ def send_to_wecom(userid, content):
         if resp.get("errcode") == 0:
             return True
         else:
-            print("发送消息失败:", resp)
+            logger.error("发送消息失败: %s", resp)
             return False
     except Exception as e:
-        print("发送消息异常:", e)
+        logger.error("发送消息异常: %s", e)
         return False
 
-# ==================== 多语言转人工检测 ====================
-def is_human_request(message):
-    cn_keywords = ["转人工", "人工客服", "人工服务", "找人工", "人工", "真人", "找客服"]
-    en_keywords = [
-        "human", "agent", "speak to human", "talk to human",
-        "customer service", "support", "real person", "live agent",
-        "transfer to human", "human agent"
-    ]
-    ar_keywords = [
-        "بشري", "دعم", "خدمة العملاء", "وكيل", "التحدث إلى بشري",
-        "تحويل إلى وكيل", "مساعد بشري"
-    ]
-    all_keywords = cn_keywords + en_keywords + ar_keywords
-    msg_lower = message.lower()
-    return any(k.lower() in msg_lower for k in all_keywords)
+def reply_to_wecom_user(userid, content):
+    """发送消息给企业微信用户（与 send_to_wecom 相同，但为了语义区分保留）"""
+    return send_to_wecom(userid, content)
 
-# ==================== 知识库检索（简单关键词） ====================
-def retrieve_knowledge(query):
-    if not knowledge_text:
-        return ""
-    keywords = [w for w in query.lower().split() if len(w) > 1]
-    if not keywords:
-        return ""
-    lines = knowledge_text.split('\n')
-    matched = []
-    for line in lines:
-        line_lower = line.lower()
-        if any(k in line_lower for k in keywords):
-            matched.append(line)
-    return "\n".join(matched[:3])
-
-# ==================== 企业微信回调验证 ====================
-def verify_wecom_signature(signature, timestamp, nonce, echostr):
-    """验证签名并解密echostr"""
+# ==================== 企业微信回调加解密 ====================
+def decrypt_wecom_msg(encrypt_msg, msg_signature, timestamp, nonce):
+    """解密企业微信推送的消息，返回解析后的字典"""
     if not WECOM_TOKEN or not WECOM_ENCODING_AES_KEY:
-        print("回调验证未配置：缺少 WECOM_TOKEN 或 WECOM_ENCODING_AES_KEY")
+        logger.warning("回调配置缺失，无法解密")
         return None
-    # 1. 排序并计算签名
-    arr = [WECOM_TOKEN, timestamp, nonce, echostr]
+
+    # 验证签名
+    arr = [WECOM_TOKEN, timestamp, nonce, encrypt_msg]
     arr.sort()
     tmp_str = "".join(arr)
     computed = hashlib.sha1(tmp_str.encode()).hexdigest()
-    if computed != signature:
+    if computed != msg_signature:
+        logger.warning("签名验证失败")
         return None
-    # 2. 解密 echostr
+
     try:
         aes_key = base64.b64decode(WECOM_ENCODING_AES_KEY + "=")
         cipher = AES.new(aes_key, AES.MODE_CBC, aes_key[:16])
-        decrypted = cipher.decrypt(base64.b64decode(echostr))
+        decrypted = cipher.decrypt(base64.b64decode(encrypt_msg))
+
         # 去除补位字符
         pad = decrypted[-1]
         content = decrypted[16:-pad]
-        # 提取实际消息（前4字节为长度）
+
+        # 前4字节为消息长度
         xml_len = struct.unpack("!I", content[:4])[0]
-        return content[4:4+xml_len].decode()
+        xml_content = content[4:4+xml_len].decode('utf-8')
+
+        # 解析 XML
+        root = ET.fromstring(xml_content)
+        to_user = root.find('ToUserName').text if root.find('ToUserName') is not None else ''
+        from_user = root.find('FromUserName').text if root.find('FromUserName') is not None else ''
+        msg_type = root.find('MsgType').text if root.find('MsgType') is not None else ''
+        content_text = root.find('Content').text if root.find('Content') is not None else ''
+
+        return {
+            'to_user': to_user,
+            'from_user': from_user,
+            'msg_type': msg_type,
+            'content': content_text
+        }
     except Exception as e:
-        print("解密 echostr 失败:", e)
+        logger.error("解密消息失败: %s", e)
         return None
 
 # ==================== Flask 路由 ====================
@@ -226,10 +260,9 @@ def chat():
         session_id = str(uuid.uuid4())
     else:
         if check_activity(session_id):
-            # 生成新会话ID，避免重复提示
             new_session_id = str(uuid.uuid4())
             reply = "由于长时间未活动，会话已结束。您可以重新开始对话。"
-            update_activity(new_session_id)
+            update_activity(new_session_id)  # 为新会话记录活动时间
             return jsonify({'reply': reply, 'session_id': new_session_id})
 
     update_activity(session_id)
@@ -244,7 +277,7 @@ def chat():
             else:
                 reply = "转接人工失败，请稍后再试或联系客服电话。"
         except Exception as e:
-            print("转人工异常:", e)
+            logger.error("转人工异常: %s", e)
             reply = "转接人工时发生内部错误，请稍后再试。"
             success = False
         return jsonify({'reply': reply, 'session_id': session_id, 'human_transferred': success})
@@ -288,18 +321,17 @@ def chat():
 
         return jsonify({'reply': ai_reply, 'session_id': session_id})
     except requests.exceptions.RequestException as e:
-        print(f"DeepSeek API 调用失败: {e}")
+        logger.error("DeepSeek API 调用失败: %s", e)
         return jsonify({'error': '服务暂时不可用，请稍后再试'}), 500
     except Exception as e:
-        print(f"未知错误: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("未知错误: %s", e, exc_info=True)
         return jsonify({'error': '服务器内部错误'}), 500
 
 @app.route('/wecom/callback', methods=['GET', 'POST'])
 def wecom_callback():
+    """企业微信回调接口"""
     if request.method == 'GET':
-        # 验证URL
+        # URL 验证
         signature = request.args.get('msg_signature')
         timestamp = request.args.get('timestamp')
         nonce = request.args.get('nonce')
@@ -308,16 +340,111 @@ def wecom_callback():
         if not all([signature, timestamp, nonce, echostr]):
             return "Missing parameters", 400
 
-        plain_echostr = verify_wecom_signature(signature, timestamp, nonce, echostr)
-        if plain_echostr:
-            return plain_echostr
+        # 使用解密函数处理 echostr（原理与解密消息相同，但返回明文）
+        # 注意：这里我们复用 decrypt_wecom_msg 不合适，因为 echostr 是加密的，但解密逻辑一样
+        # 直接调用通用解密函数
+        plain = decrypt_wecom_msg(echostr, signature, timestamp, nonce)
+        if plain:
+            # 对于 GET 验证，返回的应该是解密后的明文字符串（即 echostr 原文）
+            return plain
         else:
             return "Verification failed", 403
 
     elif request.method == 'POST':
-        # 接收企业微信推送的消息（后续可扩展）
-        # 此处仅返回 success 以通过验证
-        return "success", 200
+        # 接收消息
+        # 企业微信 POST 请求体是 XML 格式，包含加密的消息
+        raw_data = request.get_data(as_text=True)
+        try:
+            root = ET.fromstring(raw_data)
+            encrypt_msg = root.find('Encrypt').text if root.find('Encrypt') is not None else ''
+            msg_signature = request.args.get('msg_signature')
+            timestamp = request.args.get('timestamp')
+            nonce = request.args.get('nonce')
+
+            if not encrypt_msg:
+                return "success", 200
+
+            msg_data = decrypt_wecom_msg(encrypt_msg, msg_signature, timestamp, nonce)
+            if not msg_data or msg_data['msg_type'] != 'text':
+                return "success", 200
+
+            user_id = msg_data['from_user']
+            user_input = msg_data['content'].strip()
+
+            if not user_input:
+                return "success", 200
+
+            # 使用一个特殊的 session_id，便于区分来源
+            session_id = f"wecom_{user_id}"
+
+            # 检查会话是否超时（超时则清除历史，但不清除 activity？这里简化，每次消息都更新）
+            if check_activity(session_id):
+                # 超时，历史已删除，重新初始化
+                pass
+            update_activity(session_id)
+
+            # 处理转人工
+            if is_human_request(user_input):
+                notify_content = f"【企微转人工】\n用户: {user_id}\n消息: {user_input}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                success = send_to_wecom(CUSTOMER_SERVICE_USERID, notify_content)
+                reply_text = "收到，正在为您转接人工客服，请稍候..."
+                if not success:
+                    reply_text = "转接请求已发送，请稍后。"
+                reply_to_wecom_user(user_id, reply_text)
+                return "success", 200
+
+            # 无关话题过滤
+            if is_out_of_scope(user_input):
+                reply_text = "抱歉，我们只提供钢材产品相关的咨询服务。"
+                reply_to_wecom_user(user_id, reply_text)
+                return "success", 200
+
+            # AI 对话
+            history = get_session_history(session_id)
+            history.append({"role": "user", "content": user_input})
+            history = trim_history(history, max_turns=10)
+
+            knowledge = retrieve_knowledge(user_input)
+            messages_for_api = history.copy()
+            if knowledge:
+                sys_msg = messages_for_api[0]
+                sys_msg["content"] = sys_msg["content"] + f"\n\n参考知识库信息：\n{knowledge}"
+
+            headers = {
+                'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
+                'Content-Type': 'application/json'
+            }
+            payload = {
+                "model": "deepseek-chat",
+                "messages": messages_for_api,
+                "temperature": 0.7,
+                "stream": False
+            }
+
+            try:
+                resp = requests.post(DEEPSEEK_API_URL, json=payload, headers=headers, timeout=30)
+                resp.raise_for_status()
+                ai_reply = resp.json()['choices'][0]['message']['content']
+
+                history.append({"role": "assistant", "content": ai_reply})
+                history = trim_history(history, max_turns=10)
+                save_session_history(session_id, history)
+
+                reply_to_wecom_user(user_id, ai_reply)
+            except Exception as e:
+                logger.error("DeepSeek API 错误: %s", e)
+                reply_to_wecom_user(user_id, "抱歉，AI 服务暂时繁忙，请稍后再试。")
+
+            return "success", 200
+
+        except Exception as e:
+            logger.error("处理企微回调失败: %s", e, exc_info=True)
+            return "success", 200
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
