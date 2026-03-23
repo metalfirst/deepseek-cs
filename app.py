@@ -63,7 +63,7 @@ def is_out_of_scope(message):
 
 # ==================== 系统提示词 ====================
 SYSTEM_PROMPT = (
-    "你是巨红贸易(上海)有限公司（Unionmetal Trading）的AI客服助手。\n"
+    "你是上海巨红贸易有限公司（Unionmetal Trading）的AI客服助手。\n"
     "公司主营钢材出口：钢卷（热轧、冷轧、不锈钢）、钢管（无缝、焊接、方矩管）、型钢（角钢、槽钢、工字钢、H型钢）。\n"
     "你的职责仅限于回答关于钢材产品、规格、标准、采购、物流、付款等业务相关的问题。\n"
     "如果用户询问与公司业务完全无关的问题（如天气、股票、娱乐等），请礼貌地拒绝，并引导用户提出钢材相关的问题。\n"
@@ -77,11 +77,8 @@ SYSTEM_PROMPT = (
 )
 
 # ==================== 会话管理（内存） ====================
-# 结构：{session_id: {"history": list, "last_active": float, "mode": str, "pending_reply": str}}
-memory_store = {}
-
-# 记录每个客服最近一次转人工的会话ID（用于简化回复）
-last_human_session = {}   # {客服userid: session_id}
+memory_store = {}          # {session_id: {"history": list, "last_active": float, "mode": str, "pending_reply": str}}
+last_human_session = {}    # {客服userid: session_id} 用于简化客服回复
 
 def get_session_data(session_id):
     if session_id not in memory_store:
@@ -89,8 +86,8 @@ def get_session_data(session_id):
         memory_store[session_id] = {
             "history": history,
             "last_active": time.time(),
-            "mode": "auto",          # auto 或 human
-            "pending_reply": ""      # 待发送给用户的客服回复
+            "mode": "auto",
+            "pending_reply": ""
         }
         return memory_store[session_id]
     return memory_store[session_id]
@@ -244,40 +241,39 @@ def chat():
     # 会话管理
     if not session_id:
         session_id = str(uuid.uuid4())
+        logger.info("新会话创建: %s", session_id)
     else:
         if check_activity(session_id):
             new_session_id = str(uuid.uuid4())
             reply = "由于长时间未活动，会话已结束。您可以重新开始对话。"
-            # 新会话默认 auto 模式
-            get_session_data(new_session_id)  # 初始化
+            get_session_data(new_session_id)
             update_activity(new_session_id)
+            logger.info("会话 %s 已超时，新会话: %s", session_id, new_session_id)
             return jsonify({'reply': reply, 'session_id': new_session_id})
 
-    # 获取/初始化会话数据
     session_data = get_session_data(session_id)
     update_activity(session_id)
 
     # 转人工检测
     if is_human_request(user_message):
         try:
-            # 设置为人工模式
             session_data["mode"] = "human"
-            # 记录该客服最近一次转人工的会话ID
             last_human_session[CUSTOMER_SERVICE_USERID] = session_id
-            # 通知客服，简化提示（不强制要求带ID）
             notify_content = f"【网页转人工】\n会话ID: {session_id}\n消息: {user_message}\n您可以直接回复内容，系统将自动发送给该用户。"
             success = send_to_wecom(CUSTOMER_SERVICE_USERID, notify_content)
             reply = "已为您转接人工客服，客服将尽快回复您。" if success else "转接人工失败，请稍后再试。"
+            logger.info("转人工: 会话 %s, 发送通知结果 %s", session_id, success)
         except Exception as e:
             logger.error("转人工异常: %s", e)
             reply = "转接人工时发生内部错误。"
             success = False
         return jsonify({'reply': reply, 'session_id': session_id, 'human_transferred': success})
 
-    # 人工模式：将用户消息转发给客服
+    # 人工模式：转发消息给客服
     if session_data["mode"] == "human":
         forward_content = f"【用户消息】\n会话: {session_id}\n{user_message}"
         send_to_wecom(CUSTOMER_SERVICE_USERID, forward_content)
+        logger.info("人工模式：转发用户消息，会话 %s", session_id)
         return jsonify({'reply': '您的消息已转交人工客服，请耐心等待回复。', 'session_id': session_id})
 
     # 无关话题过滤（仅自动模式）
@@ -304,12 +300,13 @@ def chat():
         history.append({"role": "assistant", "content": ai_reply})
         history = trim_history(history)
         session_data["history"] = history
+        logger.info("AI回复: 会话 %s, 长度 %d", session_id, len(ai_reply))
         return jsonify({'reply': ai_reply, 'session_id': session_id})
     except Exception as e:
         logger.error("DeepSeek API 调用失败: %s", e)
         return jsonify({'error': '服务暂时不可用，请稍后再试'}), 500
 
-# ==================== 轮询接口（获取客服回复） ====================
+# ==================== 轮询接口 ====================
 @app.route('/api/poll', methods=['GET'])
 def poll():
     session_id = request.args.get('session_id')
@@ -320,12 +317,13 @@ def poll():
         return jsonify({'reply': None})
     pending = session_data.get("pending_reply", "")
     if pending:
-        session_data["pending_reply"] = ""  # 清空
+        session_data["pending_reply"] = ""
+        logger.info("轮询返回客服回复，会话 %s", session_id)
         return jsonify({'reply': pending})
     else:
         return jsonify({'reply': None})
 
-# ==================== 企业微信回调（接收客服回复） ====================
+# ==================== 企业微信回调 ====================
 @app.route('/wecom/callback', methods=['GET', 'POST'])
 def wecom_callback():
     if request.method == 'GET':
@@ -360,6 +358,7 @@ def wecom_callback():
 
             from_user = msg_data.get('FromUserName')
             content = msg_data.get('Content', '').strip()
+            logger.info("收到企业微信消息: from=%s, content=%s", from_user, content)
 
             # 如果是客服的回复
             if from_user == CUSTOMER_SERVICE_USERID:
@@ -368,31 +367,36 @@ def wecom_callback():
                 if match:
                     session_id = match.group(1)
                     reply_text = match.group(2)
+                    logger.info("指定会话模式，会话ID: %s", session_id)
                 else:
                     # 未指定会话ID，使用最近一次转人工的会话
                     session_id = last_human_session.get(from_user)
                     if not session_id:
+                        logger.warning("未找到待回复的会话，客服需使用格式：回复 <会话ID> 内容")
                         send_to_wecom(from_user, "没有找到待回复的会话，请使用格式：回复 <会话ID> 内容")
                         return "success", 200
-                    reply_text = content   # 直接使用整条消息作为回复
+                    reply_text = content
+                    logger.info("自动模式，使用最近会话: %s", session_id)
 
                 # 保存回复
                 if session_id in memory_store:
                     memory_store[session_id]["pending_reply"] = reply_text
                     send_to_wecom(from_user, f"已发送回复给用户 {session_id}")
+                    logger.info("已保存回复到会话 %s", session_id)
                 else:
+                    logger.warning("未找到会话 %s", session_id)
                     send_to_wecom(from_user, f"未找到会话 {session_id}")
                 return "success", 200
 
-            # 其他消息（如普通用户消息）暂不处理
-            logger.info("收到企业微信消息，发送者: %s, 内容: %s", from_user, content)
+            # 其他消息（普通用户发来的消息）可忽略
+            logger.info("忽略非客服消息")
             return "success", 200
 
         except Exception as e:
             logger.error("处理企微回调失败: %s", e, exc_info=True)
             return "success", 200
 
-# ==================== 企业微信域名验证路由 ====================
+# ==================== 企业微信域名验证 ====================
 @app.route('/WW_verify_5nyB6B5oVM0zoiCr.txt')
 def wecom_verify():
     return "5nyB6B5oVM0zoiCr"
